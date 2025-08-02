@@ -1,13 +1,15 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::Mutex;
-use std::fs::{File, OpenOptions};
-use std::os::unix::fs::OpenOptionsExt;
 use std::path::Path;
 
 use tonic::{transport::Server, Request, Response, Status};
 use anyhow::Result;
-use tracing::{info, error};
+use tracing::{info, error, warn};
+use std::time::Instant;
+
+mod file_io;
+use file_io::{FileIO, create_file_io};
 
 // Include the generated protobuf code
 pub mod fileservice {
@@ -27,24 +29,18 @@ struct RequestMetadata {
 }
 
 // File manager for O_DIRECT operations
-#[derive(Debug)]
 struct FileManager {
-    file: File,
+    file: Box<dyn FileIO + Send + Sync>,
     current_offset: u64,
     request_map: Arc<Mutex<HashMap<String, RequestMetadata>>>,
 }
 
 impl FileManager {
-    fn new(file_path: &str) -> Result<Self> {
-        let file = OpenOptions::new()
-            .create(true)
-            .read(true)
-            .write(true)
-            .custom_flags(0x4000) // O_DIRECT flag
-            .open(file_path)?;
+    async fn new(file_path: &str) -> Result<Self> {
+        let file = create_file_io(file_path).await?;
         
         // Get file size for current offset
-        let metadata = file.metadata()?;
+        let metadata = file.metadata().await?;
         let current_offset = metadata.len();
         
         Ok(Self {
@@ -56,31 +52,24 @@ impl FileManager {
 }
 
 // gRPC service implementation
-#[derive(Debug)]
 pub struct FileServiceImpl {
     file_manager: Arc<Mutex<FileManager>>,
 }
 
 impl FileServiceImpl {
-    fn new(file_path: &str) -> Result<Self> {
-        let file_manager = FileManager::new(file_path)?;
+    async fn new(file_path: &str) -> Result<Self> {
+        let file_manager = FileManager::new(file_path).await?;
         Ok(Self {
             file_manager: Arc::new(Mutex::new(file_manager)),
         })
     }
     
-    async fn perform_write(&self, file: File, offset: u64, data: Vec<u8>, request_id: String) -> Result<()> {
-        let aligned_data = self.align_data_for_odirect(data);
-        let size = aligned_data.len() as u64;
+    async fn perform_write(&self, mut file: Box<dyn FileIO + Send + Sync>, offset: u64, data: Vec<u8>, request_id: String) -> Result<()> {
+        let start = Instant::now();
+        let size = data.len() as u64;
         
-        tokio::task::spawn_blocking(move || {
-            use std::io::{Seek, SeekFrom, Write};
-            let mut file = file;
-            file.seek(SeekFrom::Start(offset))?;
-            file.write_all(&aligned_data)?;
-            // Note: sync_all() not needed with O_DIRECT as data is written directly to disk
-            Ok::<(), std::io::Error>(())
-        }).await??;
+        // Use trait-based async I/O
+        file.write_at(data, offset).await?;
         
         // Update metadata
         {
@@ -91,42 +80,24 @@ impl FileServiceImpl {
             file_manager.current_offset += size;
         }
         
-        info!("Written {} bytes at offset {} for request {}", size, offset, request_id);
+        let duration = start.elapsed();
+        info!("Written {} bytes at offset {} for request {} in {:?}", size, offset, request_id, duration);
+        
+        // Warn if operation takes too long (potential bottleneck)
+        if duration.as_millis() > 100 {
+            warn!("Slow write operation: {}ms for request {}", duration.as_millis(), request_id);
+        }
+        
         Ok(())
     }
     
-    async fn perform_read(&self, file: File, offset: u64, size: u64, request_id: String) -> Result<Vec<u8>> {
-        // Read aligned data (we need to read the full aligned block)
-        let aligned_size = ((size + 511) / 512) * 512; // Align to 512 bytes
-        
-        let data = tokio::task::spawn_blocking(move || {
-            use std::io::{Seek, SeekFrom, Read};
-            let mut file = file;
-            file.seek(SeekFrom::Start(offset))?;
-            
-            let mut buffer = vec![0u8; aligned_size as usize];
-            file.read_exact(&mut buffer)?;
-            
-            // Return only the original data size
-            Ok::<Vec<u8>, std::io::Error>(buffer[..size as usize].to_vec())
-        }).await??;
-        
+    async fn perform_read(&self, mut file: Box<dyn FileIO + Send + Sync>, offset: u64, size: u64, request_id: String) -> Result<Vec<u8>> {
+        let data = file.read_at(size, offset).await?;
         info!("Read {} bytes from offset {} for request {}", size, offset, request_id);
         Ok(data)
     }
     
-    fn align_data_for_odirect(&self, mut data: Vec<u8>) -> Vec<u8> {
-        // O_DIRECT requires alignment to block size (typically 512 bytes)
-        let block_size = 512;
-        let current_size = data.len();
-        let aligned_size = ((current_size + block_size - 1) / block_size) * block_size;
-        
-        if current_size < aligned_size {
-            data.resize(aligned_size, 0);
-        }
-        
-        data
-    }
+
 }
 
 #[tonic::async_trait]
@@ -141,17 +112,21 @@ impl FileService for FileServiceImpl {
         
         info!("Received write request: {}", request_id);
         
-        // Get current offset and file handle
-        let (offset, file_clone) = {
+                // Get current offset
+        let offset = {
             let file_manager = self.file_manager.lock().unwrap();
-            let offset = file_manager.current_offset;
-            let file_clone = file_manager.file.try_clone().map_err(|e| {
-                Status::internal(format!("Failed to clone file: {}", e))
-            })?;
-            (offset, file_clone)
+            file_manager.current_offset
         };
         
-                // Perform the actual write
+        // Get file handle
+        let file_clone = {
+            let file_manager = self.file_manager.lock().unwrap();
+            file_manager.file.try_clone().map_err(|e| {
+                Status::internal(format!("Failed to clone file: {}", e))
+            })?
+        };
+        
+        // Perform the actual write
         let result = self.perform_write(file_clone, offset, data.clone(), request_id.clone()).await;
         
         match result {
@@ -186,22 +161,24 @@ impl FileService for FileServiceImpl {
         
         info!("Received read request: {}", request_id);
         
-        // Get metadata and file handle
-        let (metadata, file_clone) = {
+        // Get metadata
+        let metadata = {
             let file_manager = self.file_manager.lock().unwrap();
             let request_map = file_manager.request_map.lock().unwrap();
             let metadata = request_map.get(&request_id).cloned();
             drop(request_map); // Release the request_map lock
             
-            let metadata = metadata.ok_or_else(|| {
+            metadata.ok_or_else(|| {
                 Status::not_found(format!("Request ID {} not found", request_id))
-            })?;
-            
-            let file_clone = file_manager.file.try_clone().map_err(|e| {
+            })?
+        };
+        
+        // Get file handle
+        let file_clone = {
+            let file_manager = self.file_manager.lock().unwrap();
+            file_manager.file.try_clone().map_err(|e| {
                 Status::internal(format!("Failed to clone file: {}", e))
-            })?;
-            
-            (metadata, file_clone)
+            })?
         };
         
         // Perform the actual read
@@ -229,10 +206,17 @@ impl FileService for FileServiceImpl {
     }
 }
 
-#[tokio::main]
+#[tokio::main(worker_threads = 1024)]
 async fn main() -> Result<()> {
     // Initialize logging
     tracing_subscriber::fmt::init();
+    
+    // Configure custom thread pool for high IOPS
+    let _runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(1024)
+        .max_blocking_threads(2048) // Increase blocking thread pool for 2300 IOPS
+        .enable_all()
+        .build()?;
     
     let args: Vec<String> = std::env::args().collect();
     
@@ -252,7 +236,7 @@ async fn main() -> Result<()> {
         std::fs::create_dir_all(parent)?;
     }
     
-    let file_service = FileServiceImpl::new(file_path)?;
+    let file_service = FileServiceImpl::new(file_path).await?;
     
     info!("Starting gRPC server on {}", addr);
     info!("Using O_DIRECT mode for file operations");
@@ -265,3 +249,5 @@ async fn main() -> Result<()> {
     
     Ok(())
 }
+
+
