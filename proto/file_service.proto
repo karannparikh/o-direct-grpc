@@ -1,0 +1,31 @@
+syntax = "proto3";
+
+package fileservice;
+
+service FileService {
+  rpc WriteData (WriteRequest) returns (WriteResponse);
+  rpc ReadData (ReadRequest) returns (ReadResponse);
+}
+
+message WriteRequest {
+  string request_id = 1;
+  bytes data = 2;
+}
+
+message WriteResponse {
+  string request_id = 1;
+  uint64 offset = 2;
+  bool success = 3;
+  string error_message = 4;
+}
+
+message ReadRequest {
+  string request_id = 1;
+}
+
+message ReadResponse {
+  string request_id = 1;
+  bytes data = 2;
+  bool success = 3;
+  string error_message = 4;
+} 

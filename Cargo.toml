@@ -1,0 +1,22 @@
+[package]
+name = "o_direct_grpc"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+tonic = "0.10"
+prost = "0.12"
+tokio = { version = "1.0", features = ["full"] }
+futures = "0.3"
+uuid = { version = "1.0", features = ["v4"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+anyhow = "1.0"
+tracing = "0.1"
+tracing-subscriber = "0.3"
+libc = "0.2"
+nix = "0.26"
+async-trait = "0.1"
+
+[build-dependencies]
+tonic-build = "0.10" 
